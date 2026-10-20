@@ -14,6 +14,7 @@ from apowerb.core.agent_helpers.default_llm import (
     resolve_model_credentials,
 )
 from apowerb.helpers.encryptor import decrypt_value_in_dict, dict_to_envvar
+from apowerb.helpers.model_names import default_api_base
 from apowerb.tools_store.tools_helpers import load_agent_tools_functions
 from apowerb.core.guardrails import (
     create_before_model_callback,
@@ -1015,7 +1016,9 @@ def to_agent(agent_name: str) -> LlmAgent:
                         _repair_model, _repair_params
                     )
                     _repair_api_key = _repair_params.get("model_api_key")
-                    _repair_api_base = _repair_params.get("model_api_base")
+                    _repair_api_base = _repair_params.get(
+                        "model_api_base"
+                    ) or default_api_base(_repair_model or "")
                     _repair_api_version = _repair_params.get(
                         "model_api_version"
                     ) or _repair_params.get("api_version")

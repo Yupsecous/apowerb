@@ -1198,15 +1198,10 @@ def _agent_llm_endpoint(agent_id: int) -> tuple:
     """(model, api_base, api_key, api_version) of the agent's model for the SQL tools."""
     from apowerb.core.agent_helpers import load_agent_model_params
 
+    from apowerb.helpers.model_names import default_api_base
+
     model, model_params = load_agent_model_params(agent_id)
-    api_base = model_params.get("model_api_base")
-    # OVH catalog names only, as build_litellm_model: Mistral API ids
-    # (lowercase, mistral/mistral-small) go to Mistral with the agent's key.
-    if not api_base and model.startswith("mistral/Mistral-"):
-        api_base = (
-            "https://mistral-small-3-2-24b-instruct-2506.endpoints.kepler.ai.cloud.ovh.net"
-            "/api/openai_compat/v1"
-        )
+    api_base = model_params.get("model_api_base") or default_api_base(model)
     api_version = model_params.get("model_api_version") or model_params.get("api_version")
     return model, api_base, model_params.get("model_api_key"), api_version
 
