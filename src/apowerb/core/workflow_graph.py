@@ -77,6 +77,7 @@ from google.genai import types
 from pydantic import BaseModel, Field, model_validator
 
 from apowerb.core.workflow_engine import (
+    AgentReply,
     _Finished,
     WorkflowCancelled,
     WorkflowUserError,
@@ -1829,7 +1830,7 @@ class _Compiler:
         self.services = services or NodeServices()
         self.g = graph
         self.payload = payload
-        self.run_agent = run_agent
+        self._run_agent_raw = run_agent
         self.run_tool = run_tool
         self.run_rag = run_rag
         self.run_notify = run_notify
@@ -1847,6 +1848,9 @@ class _Compiler:
         # Ce que le nœud a reçu et les outils appelés par son agent, joints à
         # son node_complete ou node_error (voir _note_input).
         self._trace: dict[str, dict] = {}
+        # Identifiants rendus par les outils d'un nœud agent, ajoutés à son
+        # node_complete : à côté de la sortie, pour que {{id}} garde sa forme.
+        self._artifacts: dict[str, list[dict]] = {}
 
     def _note_input(self, node: Node, value: Any) -> None:
         """Montre au panneau Test ce que ``node`` va recevoir, dès maintenant.
@@ -1869,6 +1873,19 @@ class _Compiler:
             }
         self._trace[node.id] = fields
         self.emit({"event": "node_input", "node_id": node.id, **fields})
+
+    async def _agent_reply(self, agent_id: str, message: str) -> AgentReply:
+        # Un run_agent injecté peut rendre la valeur seule (stubs, anciens
+        # appelants) ou une AgentReply (production, run_agent_message).
+        reply = await self._run_agent_raw(agent_id, message)
+        return reply if isinstance(reply, AgentReply) else AgentReply(output=reply)
+
+    async def run_agent(self, agent_id: str, message: str) -> Any:
+        return (await self._agent_reply(agent_id, message)).output
+
+    def _artifacts_of(self, node_id: str) -> dict:
+        found = self._artifacts.pop(node_id, None)
+        return {"artifacts": found} if found else {}
 
     def _service(self, node: Node, name: str):
         fn = getattr(self.services, name)
@@ -1996,6 +2013,7 @@ class _Compiler:
                 "output": result,
                 "duration_ms": round((time.monotonic() - t0) * 1000),
                 **trace,
+                **self._artifacts_of(node.id),
             }
             if node.type == "agent" and _asks_question(result):
                 complete["asks_question"] = True
@@ -2045,12 +2063,13 @@ class _Compiler:
                 self._note_input(node, msg)
                 with collect_tool_calls() as calls:
                     try:
-                        result = await self.run_agent(
+                        reply = await self._agent_reply(
                             cfg["agent_id"], AgentNodeMessage(msg)
                         )
                     finally:
                         self._trace[node.id]["tool_calls"] = calls
-                return result, None
+                self._artifacts[node.id] = reply.artifacts
+                return reply.output, None
         elif node.type == "tool":
 
             async def body(node_input):
@@ -2370,7 +2389,7 @@ class _Compiler:
         inner = _Compiler(
             body,
             payload,
-            self.run_agent,
+            self._run_agent_raw,
             self.run_tool,
             queue.put_nowait,
             self.cancel,
