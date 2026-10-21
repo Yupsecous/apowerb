@@ -329,7 +329,7 @@ def test_http_leaf_runner_goes_through_guards_session_and_run(monkeypatch):
         calls.append(("session", kw["agent_name"], kw["user_id"], kw["token"]))
 
     async def _run(**kw):
-        calls.append(("run", kw["new_message"]["parts"][0]["text"], kw["session_id"]))
+        calls.append(("run", kw["new_message"]["parts"][-1]["text"], kw["session_id"]))
         return [{"content": {"parts": [{"text": '```json\n{"ok": true}\n```'}]}}]
 
     monkeypatch.setattr(gate, "apply_run_guards", _guards)

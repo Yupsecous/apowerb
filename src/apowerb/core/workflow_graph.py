@@ -77,6 +77,7 @@ from google.genai import types
 from pydantic import BaseModel, Field, model_validator
 
 from apowerb.core.workflow_engine import (
+    AgentReply,
     _Finished,
     WorkflowCancelled,
     WorkflowUserError,
@@ -1690,6 +1691,41 @@ def validate_graph(
 # --- Compilation ------------------------------------------------------------
 
 
+# Ce qui peut suivre le point d'interrogation final sans changer le sens :
+# espaces, emphase Markdown, clôture de code, guillemets fermants,
+# parenthèses et crochets.
+_TRAILING_NOISE = " \t\r\n*_`~\"'»”’)]>"
+_QUESTION_MARKS = ("?", "？")
+
+
+def _last_line(text: str) -> str:
+    lines = [ln.strip() for ln in text.strip().splitlines()]
+    lines = [ln for ln in lines if ln.strip(_TRAILING_NOISE)]
+    return lines[-1] if lines else ""
+
+
+def ends_with_question(output: Any) -> bool:
+    """La sortie texte d'un agent se termine-t-elle par une question ?
+
+    Détection volontairement simple : la dernière ligne non vide, débarrassée
+    de l'emphase Markdown, des clôtures de code et des fermetures
+    (guillemets, parenthèses), finit par un point d'interrogation. Un agent
+    de workflow qui finit ainsi s'adresse à un utilisateur qui n'est pas là
+    (« Que souhaitez-vous faire ? »).
+
+    Limites connues : une question suivie d'une phrase (« … ? Je peux aussi
+    X. »), une demande à l'impératif (« Dites-moi la période. », « J'attends
+    que vous me communiquiez… ») ou une promesse (« Je récupère la
+    moyenne… ») ne sont PAS détectées ; une sortie JSON ou non textuelle
+    n'est jamais signalée. Une dernière ligne qui cite une question
+    rhétorique serait signalée à tort — d'où un avertissement, jamais un
+    échec du run.
+    """
+    if not isinstance(output, str):
+        return False
+    return _last_line(output).rstrip(_TRAILING_NOISE).endswith(_QUESTION_MARKS)
+
+
 def _adk_name(node_id: str) -> str:
     return "n_" + node_id.replace("-", "_")
 
@@ -1802,7 +1838,7 @@ class _Compiler:
         self.services = services or NodeServices()
         self.g = graph
         self.payload = payload
-        self.run_agent = run_agent
+        self._run_agent_raw = run_agent
         self.run_tool = run_tool
         self.run_rag = run_rag
         self.run_notify = run_notify
@@ -1817,6 +1853,21 @@ class _Compiler:
         self.workflow_stack = workflow_stack
         self.depth = depth
         self.outputs: dict[str, Any] = {}
+        # Champs ajoutés au node_complete d'un nœud (warnings, artifacts) :
+        # à côté de la sortie, jamais dedans, pour que {{id}} garde sa forme.
+        self._node_meta: dict[str, dict] = {}
+        # Avertissements de tous les nœuds, recopiés dans l'événement done :
+        # un run lancé par un déclencheur ne lit que ce terminal.
+        self.warnings: list[dict] = []
+
+    async def _agent_reply(self, agent_id: str, message: str) -> AgentReply:
+        # Un run_agent injecté peut rendre la valeur seule (stubs, anciens
+        # appelants) ou une AgentReply (production, run_agent_message).
+        reply = await self._run_agent_raw(agent_id, message)
+        return reply if isinstance(reply, AgentReply) else AgentReply(output=reply)
+
+    async def run_agent(self, agent_id: str, message: str) -> Any:
+        return (await self._agent_reply(agent_id, message)).output
 
     def _service(self, node: Node, name: str):
         fn = getattr(self.services, name)
@@ -1908,7 +1959,12 @@ class _Compiler:
             t0 = time.monotonic()
             try:
                 result, route = await body(node_input)
+                extra = self._node_meta.pop(node.id, {})
+                self.warnings += [
+                    {"node_id": node.id, **w} for w in extra.get("warnings", [])
+                ]
             except Exception as exc:
+                self._node_meta.pop(node.id, None)
                 self.emit(
                     {
                         "event": "node_error",
@@ -1936,6 +1992,7 @@ class _Compiler:
                     "node_id": node.id,
                     "output": result,
                     "duration_ms": round((time.monotonic() - t0) * 1000),
+                    **extra,
                 }
             )
             if route is not None:
@@ -1970,7 +2027,20 @@ class _Compiler:
                     )
                 else:
                     msg = leaf_message(node_input)
-                return await self.run_agent(cfg["agent_id"], msg), None
+                reply = await self._agent_reply(cfg["agent_id"], msg)
+                meta: dict[str, Any] = {}
+                if ends_with_question(reply.output):
+                    meta["warnings"] = [
+                        {
+                            "code": "agent_asked_question",
+                            "detail": _last_line(reply.output)[:200],
+                        }
+                    ]
+                if reply.artifacts:
+                    meta["artifacts"] = reply.artifacts
+                if meta:
+                    self._node_meta[node.id] = meta
+                return reply.output, None
         elif node.type == "tool":
 
             async def body(node_input):
@@ -2289,7 +2359,7 @@ class _Compiler:
         inner = _Compiler(
             body,
             payload,
-            self.run_agent,
+            self._run_agent_raw,
             self.run_tool,
             queue.put_nowait,
             self.cancel,
@@ -2509,4 +2579,7 @@ async def run_graph(
     elif exc is not None:
         yield _sse({"event": "error", **error_fields(exc)})
     else:
-        yield _sse({"event": "done", "output": _final_output(graph, compiler.outputs)})
+        done = {"event": "done", "output": _final_output(graph, compiler.outputs)}
+        if compiler.warnings:
+            done["warnings"] = compiler.warnings
+        yield _sse(done)
