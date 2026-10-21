@@ -21,6 +21,13 @@ runs a workflow with an attached file:
   same agent, in a fresh session; a persisted workflow run replays the graph
   of the version it ran, and fails if that graph is gone.
 
+* ``GET /api/workflows/runs/awaiting``, ``POST /runs/{run_id}/resume`` and
+  ``POST /runs/{run_id}/abandon`` — a graph run stopped on a human decision
+  (``approval`` node, status ``awaiting``): the decisions waiting for the
+  caller (owner or assignee), the answer that resumes the **same** run (its
+  stream replays the nodes already done, flagged ``replayed``), or closing
+  it unanswered.
+
 * ``GET /api/workflows/tools/schema?tool=<tool_ref>`` — the argument schema
   of one tool (types, required, defaults, per-arg description), so the
   studio's node inspector can build its form without hardcoding it per tool.
@@ -209,8 +216,16 @@ def _is_graph_run(agent_ids: list, config: dict) -> bool:
     return not agent_ids and "workflow_id" in config and "version" in config
 
 
+def pause_saver(run_id: str) -> Callable[[dict], None]:
+    """Le ``on_await`` de ``run_graph`` : la pause est écrite sous ce run."""
+    return lambda snapshot: run_main.pause_run(run_id, snapshot)
+
+
 async def _graph_replay_runner(
-    owner: str, config: dict[str, Any], cancel_event: asyncio.Event
+    owner: str,
+    config: dict[str, Any],
+    cancel_event: asyncio.Event,
+    run_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Rejoue un run de workflow : le graphe de la version qu'il avait exécutée.
 
@@ -255,6 +270,94 @@ async def _graph_replay_runner(
         services=workflow_runtime.services_for(owner),
         # Un « Tester jusqu'ici » se rejoue tel quel, sans son aval.
         until=config.get("until"),
+        on_await=pause_saver(run_id) if run_id else None,
+        run_id=run_id,
+    ):
+        yield chunk
+
+
+# Ce que l'assigné d'une décision ne reçoit pas du run d'un autre : les
+# données du propriétaire (sorties, entrées, appels d'outils, graphiques).
+_OWNER_ONLY_FIELDS = (
+    "output",
+    "input",
+    "input_truncated",
+    "input_length",
+    "tool_calls",
+    "artifacts",
+    "reported_error",
+)
+
+
+def _for_assignee(chunk: str, user: str) -> str:
+    try:
+        event = json.loads(chunk[len("data: "):])
+    except ValueError:
+        return chunk
+    for field in _OWNER_ONLY_FIELDS:
+        event.pop(field, None)
+    if event.get("event") == "awaiting_input" and (event.get("assignee") or "").lower() != user.lower():
+        # Une décision suivante qui ne lui revient pas : il sait seulement
+        # que le run attend.
+        for field in ("question", "choices"):
+            event.pop(field, None)
+    return "data: " + json.dumps(event, ensure_ascii=False, default=str) + "\n\n"
+
+
+async def _decision_resume_runner(
+    run_id: str, claimed: dict[str, Any], cancel_event: asyncio.Event
+) -> AsyncGenerator[str, None]:
+    """Reprend un run arrêté sur une décision, sous l'identité du propriétaire.
+
+    Le graphe est celui de l'instantané (la version qui tournait), pas la
+    version courante du workflow : une édition entre-temps ne change pas un
+    run déjà à moitié fait. ``claimed["decided"]`` passe à vrai quand le nœud
+    de décision a rendu la réponse : avant, un arrêt remet le run en attente
+    (voir ``_streaming_run``). L'assigné reçoit le flux sans les données du
+    propriétaire.
+    """
+    answer = claimed["answer"]
+    redact = answer["answered_by"] != claimed["run"]["owner_id"]
+    async for chunk in _decision_resume_stream(run_id, claimed, cancel_event):
+        if f'"node_id": "{answer["node_id"]}"' in chunk and '"node_complete"' in chunk:
+            claimed["decided"] = True
+        yield _for_assignee(chunk, answer["answered_by"]) if redact else chunk
+
+
+async def _decision_resume_stream(
+    run_id: str, claimed: dict[str, Any], cancel_event: asyncio.Event
+) -> AsyncGenerator[str, None]:
+    from apowerb.core import workflow_graph, workflow_runtime
+    from apowerb.core.run_gate import resolve_owner_plan
+
+    owner, state = claimed["run"]["owner_id"], claimed["state"]
+    try:
+        graph = workflow_graph.WorkflowGraph.model_validate(state["graph"])
+        run_agent, run_tool, run_rag, run_notify = workflow_runtime.bindings_for(
+            owner, await resolve_owner_plan(owner)
+        )
+    except Exception as exc:  # noqa: BLE001 - l'issue doit être consignée
+        yield (
+            "data: "
+            + json.dumps({"event": "error", "detail": f"{type(exc).__name__}: {exc}"})
+            + "\n\n"
+        )
+        return
+    async for chunk in workflow_graph.run_graph(
+        graph,
+        payload=state.get("payload"),
+        run_agent=run_agent,
+        run_tool=run_tool,
+        run_rag=run_rag,
+        run_subworkflow=workflow_runtime.resolve_workflow_for(owner),
+        workflow_id=claimed["run"]["config"].get("workflow_id"),
+        cancel_event=cancel_event,
+        run_notify=run_notify,
+        services=workflow_runtime.services_for(owner),
+        on_await=pause_saver(run_id),
+        resume={**state, "answer": claimed["answer"]},
+        run_id=run_id,
+        until=state.get("until"),
     ):
         yield chunk
 
@@ -298,7 +401,11 @@ def _terminal_event(chunk: Any) -> Optional[dict]:
         payload = json.loads(text[len("data: "):])
     except ValueError:
         return None
-    if isinstance(payload, dict) and payload.get("event") in ("error", "cancelled"):
+    if isinstance(payload, dict) and payload.get("event") in (
+        "error",
+        "cancelled",
+        "awaiting_input",
+    ):
         return payload
     return None
 
@@ -329,6 +436,7 @@ def _streaming_run(
     file_bytes: Optional[bytes],
     owner: str,
     runner: Optional[Callable[[asyncio.Event], AsyncGenerator[str, None]]] = None,
+    resume_guard: Optional[dict] = None,
 ) -> StreamingResponse:
     """Drive one run and stream it, recording how it ends.
 
@@ -342,7 +450,7 @@ def _streaming_run(
     mémoire, qui oubliait le run à la fin du flux.
     """
     cancel_event = asyncio.Event()
-    _runs[run_id] = {
+    entry = _runs[run_id] = {
         "cancel_event": cancel_event,
         "owner": owner,
         "task": None,
@@ -363,28 +471,34 @@ def _streaming_run(
                 else _workflow_runner(run_id, cancel_event, agent_ids, file_bytes)
             )
             async for chunk in stream:
-                yield chunk.encode() if isinstance(chunk, str) else chunk
+                # L'issue est lue AVANT de céder le morceau : un client qui
+                # part pendant ce ``yield`` ne doit pas la faire mentir.
                 terminal = _terminal_event(chunk)
                 if terminal is not None and terminal["event"] == "error":
                     outcome = run_main.STATUS_ERROR
                     error_message = str(terminal.get("detail") or "")
+                elif terminal is not None and terminal["event"] == "awaiting_input":
+                    # Déjà consigné par ``run_main.pause_run`` (on_await).
+                    outcome = run_main.STATUS_AWAITING
                 elif terminal is not None:
                     outcome = run_main.STATUS_CANCELLED
                 else:
                     is_done, done_output = _done_output(chunk)
                     if is_done:
                         final_output = done_output
+                yield chunk.encode() if isinstance(chunk, str) else chunk
                 if cancel_event.is_set():
                     # Drain one more iteration if the runner hasn't noticed.
                     continue
-            if cancel_event.is_set():
+            if cancel_event.is_set() and outcome != run_main.STATUS_AWAITING:
                 outcome = run_main.STATUS_CANCELLED
         except asyncio.CancelledError:
             # Le client s'est deconnecte : signaler l'annulation aux travaux
             # que le graphe a pu lancer hors de l'arbre de la task de drive
             # (sous-workflows, attentes de retry) et qui lisent cancel_event.
             cancel_event.set()
-            outcome = run_main.STATUS_CANCELLED
+            if outcome != run_main.STATUS_AWAITING:
+                outcome = run_main.STATUS_CANCELLED
             yield f"data: {json.dumps({'event': 'cancelled'})}\n\n".encode()
             raise
         except Exception as exc:  # noqa: BLE001 - l'issue doit être consignée
@@ -397,34 +511,56 @@ def _streaming_run(
                 + "\n\n"
             ).encode()
         finally:
-            _runs.pop(run_id, None)
-            try:
-                run_main.finish_run(run_id, status=outcome, error_message=error_message)
-            except Exception:  # noqa: BLE001 - la trace ne doit pas casser le flux
-                logger.exception(
-                    "[workflows] issue du run_id=%s non consignee", run_id
-                )
-            # T2 — un run de graphe (persisté, ``config.workflow_id`` connu)
-            # peut avoir des workflows en écoute (``workflow_done``). Import
-            # différé : ``workflow_triggers`` importe ce module pour
-            # ``launch_triggered_run`` — un import de niveau module créerait
-            # un cycle. Best-effort : un échec de notification ne doit
-            # jamais retirer au client le flux qu'il vient de recevoir.
-            try:
-                from apowerb.core import workflow_triggers as _wt
+            # Une reprise du même run a pu déjà se réinscrire sous ce run_id.
+            if _runs.get(run_id) is entry:
+                _runs.pop(run_id, None)
+            # Pas de ``return`` dans ce ``finally`` : il avalerait le
+            # ``CancelledError`` d'un client parti.
+            settles = True
+            if resume_guard is not None and not resume_guard.get("decided"):
+                settles = False
+                if outcome != run_main.STATUS_AWAITING:
+                    # La reprise n'a pas atteint la décision (client parti,
+                    # panne au démarrage) : rien n'a été fait, le run attend
+                    # toujours sa réponse.
+                    try:
+                        run_main.release_paused_run(run_id)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[workflows] run_id=%s non remis en attente", run_id
+                        )
+            elif outcome == run_main.STATUS_AWAITING:
+                # Une pause n'est pas une fin : ni ``finished_at``, ni
+                # notification ``workflow_done``. La reprise finira le run.
+                settles = False
+            if settles:
+                try:
+                    run_main.finish_run(run_id, status=outcome, error_message=error_message)
+                except Exception:  # noqa: BLE001 - la trace ne doit pas casser le flux
+                    logger.exception(
+                        "[workflows] issue du run_id=%s non consignee", run_id
+                    )
+                # T2 — un run de graphe (persisté, ``config.workflow_id`` connu)
+                # peut avoir des workflows en écoute (``workflow_done``). Import
+                # différé : ``workflow_triggers`` importe ce module pour
+                # ``launch_triggered_run`` — un import de niveau module créerait
+                # un cycle. Best-effort : un échec de notification ne doit
+                # jamais retirer au client le flux qu'il vient de recevoir.
+                try:
+                    from apowerb.core import workflow_triggers as _wt
 
-                await _wt.notify_run_finished(
-                    run_id=run_id,
-                    owner_id=owner,
-                    status=outcome,
-                    output=final_output,
-                    error_message=error_message,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "[workflows] notification workflow_done non envoyee (run_id=%s)",
-                    run_id,
-                )
+                    await _wt.notify_run_finished(
+                        run_id=run_id,
+                        owner_id=owner,
+                        status=outcome,
+                        output=final_output,
+                        error_message=error_message,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "[workflows] notification workflow_done non envoyee (run_id=%s)",
+                        run_id,
+                    )
 
     return StreamingResponse(
         _event_generator(),
@@ -583,6 +719,73 @@ async def list_runs(
     return run_main.list_runs(current_user.email, limit=limit)
 
 
+@router.get("/runs/awaiting")
+async def list_awaiting_runs(
+    current_user: user_schemas.User = Depends(get_current_user),
+):
+    """Les runs arrêtés sur une décision humaine qui revient à l'appelant.
+
+    Déclarée avant ``/runs/{run_id}`` : sinon ``awaiting`` serait lu comme
+    un identifiant de run.
+    """
+    from apowerb.core import workflow_main
+
+    items = run_main.list_awaiting(current_user.email)
+    names: dict[tuple, Optional[str]] = {}
+    for item in items:
+        key = (item["workflow_id"], item["owner_id"])
+        if key not in names:
+            wf = (
+                workflow_main.get_workflow(key[0], owner_id=key[1])
+                if key[0]
+                else None
+            )
+            names[key] = (wf or {}).get("name")
+        item["workflow_name"] = names[key]
+    return items
+
+
+class DecisionAnswer(BaseModel):
+    choice: Optional[str] = Field(None, max_length=200)
+    text: Optional[str] = Field(None, max_length=10_000)
+
+
+@router.post("/runs/{run_id}/resume")
+async def resume_run(
+    run_id: str,
+    body: DecisionAnswer,
+    current_user: user_schemas.User = Depends(get_current_user),
+):
+    """Répond à la décision d'un run en attente et le reprend (SSE).
+
+    Même ``run_id`` : le flux rejoue les nœuds déjà faits (``replayed``,
+    jamais réexécutés), puis continue. 404 si le run n'est pas à l'appelant
+    (propriétaire ou assigné), 409 s'il n'attend plus, 422 si la réponse
+    n'est pas permise par la décision.
+    """
+    claimed = run_main.claim_paused_run(
+        run_id, current_user.email, body.choice, body.text
+    )
+    return _streaming_run(
+        run_id=run_id,
+        agent_ids=[],
+        file_bytes=None,
+        owner=claimed["run"]["owner_id"],
+        runner=lambda cancel: _decision_resume_runner(run_id, claimed, cancel),
+        resume_guard=claimed,
+    )
+
+
+@router.post("/runs/{run_id}/abandon")
+async def abandon_run(
+    run_id: str,
+    current_user: user_schemas.User = Depends(get_current_user),
+):
+    """Clôt sans réponse un run en attente d'une décision (``cancelled``)."""
+    run_main.abandon_paused_run(run_id, current_user.email)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("/runs/{run_id}")
 async def get_run(
     run_id: str,
@@ -622,12 +825,15 @@ async def replay_run(
         )
     if _is_graph_run(replay["agent_ids"], replay["config"]):
         owner, config = current_user.email, replay["config"]
+        new_run_id = replay["run_id"]
         return _streaming_run(
-            run_id=replay["run_id"],
+            run_id=new_run_id,
             agent_ids=[],
             file_bytes=None,
             owner=owner,
-            runner=lambda cancel: _graph_replay_runner(owner, config, cancel),
+            runner=lambda cancel: _graph_replay_runner(
+                owner, config, cancel, run_id=new_run_id
+            ),
         )
     return _streaming_run(
         run_id=replay["run_id"],

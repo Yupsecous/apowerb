@@ -558,7 +558,7 @@ async def launch_triggered_run(
     from apowerb.core import workflow_runtime as rt
     from apowerb.core.run_gate import resolve_owner_plan
     from apowerb.core.workflow_graph import run_graph
-    from apowerb.routers.workflows import _streaming_run
+    from apowerb.routers.workflows import _streaming_run, pause_saver
 
     wf = workflow_main.get_workflow(workflow_id, owner_id=owner_id)
     if wf is None or wf.get("status") != "published":
@@ -593,6 +593,8 @@ async def launch_triggered_run(
             cancel_event=cancel_event,
             run_notify=run_notify,
             services=rt.services_for(owner_id),
+            on_await=pause_saver(run_id),
+            run_id=run_id,
         )
 
     response = _streaming_run(
@@ -621,6 +623,7 @@ async def launch_triggered_run(
                 "done",
                 "error",
                 "cancelled",
+                "awaiting_input",
             ):
                 terminal = payload
         return terminal
@@ -1095,4 +1098,11 @@ async def call_agent_tool(
         return {"run_id": run_id, "output": terminal.get("output")}
     if event == "cancelled":
         return {"error": "cancelled", "run_id": run_id}
+    if event == "awaiting_input":
+        # Le run attend une décision humaine : il reprendra plus tard.
+        return {
+            "status": "awaiting_decision",
+            "run_id": run_id,
+            "question": terminal.get("question"),
+        }
     return {"error": "run_failed", "run_id": run_id, "detail": terminal.get("detail")}
