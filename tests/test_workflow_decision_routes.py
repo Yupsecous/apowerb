@@ -187,7 +187,7 @@ async def test_the_assignee_sees_and_answers_and_the_run_stays_the_owners(api):
     _, events = await _paused(api, assignee=ASSIGNEE)
     run_id = events[0]["wid"]
     [item] = await api.runs.list_awaiting_runs(current_user=_user(ASSIGNEE))
-    assert item["run_id"] == run_id and item["owner_id"] == OWNER
+    assert item["run_id"] == run_id and item["mine"] is False
     resumed = await _drain(await _resume(api, run_id, user=ASSIGNEE, choice="non"))
     assert resumed[-1]["event"] == "done"
     assert run_main.get_run(run_id, owner_id=OWNER)["status"] == "success"
@@ -279,16 +279,22 @@ async def test_a_decision_answered_after_hours_is_not_settled_as_an_orphan(api):
 
 
 @pytest.mark.asyncio
-async def test_a_client_gone_before_the_decision_leaves_it_waiting(api):
+async def test_a_client_gone_after_answering_does_not_cancel_the_run(api):
+    import asyncio
+
     _, events = await _paused(api)
     run_id = events[0]["wid"]
     response = await _resume(api, run_id, choice="oui")
     stream = response.body_iterator
     await stream.__anext__()  # run_started, puis le client part
     await stream.aclose()
-    assert run_main.get_run(run_id, owner_id=OWNER)["status"] == "awaiting"
-    resumed = await _drain(await _resume(api, run_id, choice="non"))
-    assert resumed[-1] == {"event": "done", "output": "non:"}
+    # La réponse est donnée : la reprise va au bout sans la connexion.
+    await asyncio.gather(*list(api.runs._detached_runs))
+    run = run_main.get_run(run_id, owner_id=OWNER)
+    assert run["status"] == "success"
+    with pytest.raises(HTTPException) as exc:
+        await _resume(api, run_id, choice="non")
+    assert exc.value.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -375,3 +381,355 @@ async def test_a_partial_test_up_to_the_decision_resumes_as_partial(api):
     assert resumed[-1]["partial"] is True and resumed[-1]["until"] == "d"
     assert resumed[-1]["output"]["choice"] == "oui"
     assert not [e for e in resumed if e.get("node_id") in ("yes", "no")]
+
+
+# --- Suivi : la décision prise est consignée par le moteur ------------------
+
+
+def _graph_with_agent_after():
+    graph = _graph()
+    graph["nodes"][2] = {"id": "yes", "type": "agent", "config": {"agent_id": "agent1"}}
+    return graph
+
+
+@pytest.mark.asyncio
+async def test_the_decision_is_recorded_as_taken_before_the_next_step_runs(api, monkeypatch):
+    from apowerb.core import workflow_runtime
+
+    seen = []
+
+    async def _agent(agent_id, message):
+        t = run_main.run_store.run_table
+        with run_main.run_store.engine.begin() as conn:
+            row = conn.execute(t.select().where(t.c.status == "running")).fetchone()
+        seen.append((row.status, row.paused_state))
+        return "fait"
+
+    async def _tool(tool, args):
+        return {}
+
+    monkeypatch.setattr(
+        workflow_runtime, "bindings_for", lambda owner, plan: (_agent, _tool, None, None)
+    )
+    wf = workflow_main.create_workflow(owner_id=OWNER, name="Devis", graph=_graph_with_agent_after())
+    events = await _drain(
+        await api.defs.run_workflow(wf["workflow_id"], api.defs.RunBody(payload={"x": 1}), current_user=_user())
+    )
+    run_id = events[0]["wid"]
+    resumed = await _drain(await _resume(api, run_id, choice="oui"))
+    assert resumed[-1]["event"] == "done"
+    # Pendant l'étape suivante, la base sait déjà que la décision est prise :
+    # une coupure à ce moment ne doit plus remettre le run en attente.
+    assert seen == [("running", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_resume_that_died_before_the_decision_goes_back_to_waiting(api):
+    _, events = await _paused(api)
+    run_id = events[0]["wid"]
+    t = run_main.run_store.run_table
+    with run_main.run_store.engine.begin() as conn:
+        # Le processus est mort juste après la prise : ligne running, état gardé.
+        conn.execute(
+            t.update().where(t.c.run_id == run_id).values(status="running", resumed_at="2026-01-01 00:00:00.000000")
+        )
+    # Sans que le propriétaire ouvre le run : la liste et la reprise la voient.
+    assert [i["run_id"] for i in await api.runs.list_awaiting_runs(current_user=_user())] == [run_id]
+    resumed = await _drain(await _resume(api, run_id, choice="oui"))
+    assert resumed[-1] == {"event": "done", "output": "ok:oui"}
+
+
+@pytest.mark.asyncio
+async def test_a_resume_that_died_before_the_decision_is_listed_and_answerable_by_the_assignee(api):
+    _, events = await _paused(api, assignee=ASSIGNEE)
+    run_id = events[0]["wid"]
+    t = run_main.run_store.run_table
+    with run_main.run_store.engine.begin() as conn:
+        conn.execute(
+            t.update().where(t.c.run_id == run_id).values(status="running", resumed_at="2026-01-01 00:00:00.000000")
+        )
+    assert [i["run_id"] for i in await api.runs.list_awaiting_runs(current_user=_user(ASSIGNEE))] == [run_id]
+    resumed = await _drain(await _resume(api, run_id, user=ASSIGNEE, choice="oui"))
+    assert resumed[-1]["event"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_a_resume_still_within_its_delay_is_not_put_back_to_waiting(api):
+    _, events = await _paused(api)
+    run_id = events[0]["wid"]
+    t = run_main.run_store.run_table
+    with run_main.run_store.engine.begin() as conn:
+        conn.execute(t.update().where(t.c.run_id == run_id).values(status="running", resumed_at=run_main._now()))
+    assert await api.runs.list_awaiting_runs(current_user=_user()) == []
+    with pytest.raises(HTTPException) as exc:
+        await _resume(api, run_id, choice="oui")
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_a_resume_that_died_after_the_decision_is_settled_as_an_error(api):
+    _, events = await _paused(api)
+    run_id = events[0]["wid"]
+    t = run_main.run_store.run_table
+    with run_main.run_store.engine.begin() as conn:
+        conn.execute(
+            t.update()
+            .where(t.c.run_id == run_id)
+            .values(status="running", paused_state=None, resumed_at="2026-01-01 00:00:00.000000")
+        )
+    assert run_main.get_run(run_id, owner_id=OWNER)["status"] == "error"
+
+
+# --- Délai d'attente ----------------------------------------------------------
+
+
+def _expire(run_id):
+    """L'échéance de la décision est passée."""
+    t = run_main.run_store.run_table
+    with run_main.run_store.engine.begin() as conn:
+        conn.execute(
+            t.update().where(t.c.run_id == run_id).values(expires_at="2026-01-01 00:00:00.000000")
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_list_says_until_when_the_decision_waits(api):
+    from datetime import datetime, timedelta
+
+    _, events = await _paused(api)
+    [item] = await api.runs.list_awaiting_runs(current_user=_user())
+    paused = datetime.fromisoformat(item["paused_at"])
+    expires = datetime.fromisoformat(item["expires_at"])
+    # ISO avec fuseau : le navigateur ne devine pas l'heure du serveur.
+    assert paused.tzinfo is not None and expires.tzinfo is not None
+    assert expires - paused == timedelta(hours=168)
+
+
+@pytest.mark.asyncio
+async def test_an_expired_decision_cannot_be_answered_even_by_its_owner(api):
+    _, events = await _paused(api)
+    run_id = events[0]["wid"]
+    _expire(run_id)
+    with pytest.raises(HTTPException) as exc:
+        await _resume(api, run_id, choice="oui")
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "decision_expired"
+    run = run_main.get_run(run_id, owner_id=OWNER)
+    assert run["status"] == "error" and "expir" in run["error_message"]
+    assert await api.runs.list_awaiting_runs(current_user=_user()) == []
+
+
+@pytest.mark.asyncio
+async def test_an_expired_decision_cannot_be_abandoned_either(api):
+    _, events = await _paused(api)
+    run_id = events[0]["wid"]
+    _expire(run_id)
+    with pytest.raises(HTTPException) as exc:
+        await api.runs.abandon_run(run_id, current_user=_user())
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "decision_expired"
+
+
+@pytest.mark.asyncio
+async def test_an_expired_decision_leaves_the_list_and_is_settled_on_read(api):
+    _, events = await _paused(api, assignee=ASSIGNEE)
+    run_id = events[0]["wid"]
+    _expire(run_id)
+    assert await api.runs.list_awaiting_runs(current_user=_user(ASSIGNEE)) == []
+    # Ce que lit le planificateur : le run n'attend plus, il peut relancer.
+    assert run_main.get_run(run_id, owner_id=OWNER)["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_a_decision_still_within_its_delay_is_not_expired(api):
+    _, events = await _paused(api)
+    run_id = events[0]["wid"]
+    # Une autre décision expirée ne touche pas celle-ci.
+    _, other = await _paused(api)
+    _expire(other[0]["wid"])
+    assert [i["run_id"] for i in await api.runs.list_awaiting_runs(current_user=_user())] == [run_id]
+    resumed = await _drain(await _resume(api, run_id, choice="oui"))
+    assert resumed[-1] == {"event": "done", "output": "ok:oui"}
+
+
+# --- Instantané au repos ------------------------------------------------------
+
+
+def _stored_state(run_id):
+    t = run_main.run_store.run_table
+    with run_main.run_store.engine.begin() as conn:
+        return conn.execute(t.select().where(t.c.run_id == run_id)).fetchone()._asdict()["paused_state"]
+
+
+@pytest.mark.asyncio
+async def test_the_saved_state_is_encrypted_at_rest(api):
+    _, events = await _paused(api)
+    raw = _stored_state(events[0]["wid"])
+    assert raw and not raw.startswith("{")
+    assert "devis" not in raw and "Valider" not in raw
+
+
+@pytest.mark.asyncio
+async def test_a_state_saved_in_clear_before_encryption_still_resumes(api):
+    from apowerb.helpers.encryptor import decrypt_value
+
+    _, events = await _paused(api)
+    run_id = events[0]["wid"]
+    clear = decrypt_value(_stored_state(run_id))
+    t = run_main.run_store.run_table
+    with run_main.run_store.engine.begin() as conn:
+        conn.execute(t.update().where(t.c.run_id == run_id).values(paused_state=clear))
+    resumed = await _drain(await _resume(api, run_id, choice="oui"))
+    assert resumed[-1] == {"event": "done", "output": "ok:oui"}
+
+
+@pytest.mark.asyncio
+async def test_the_list_says_whose_run_it_is_without_the_owners_email(api):
+    await _paused(api, assignee=ASSIGNEE)
+    [mine] = await api.runs.list_awaiting_runs(current_user=_user())
+    [theirs] = await api.runs.list_awaiting_runs(current_user=_user(ASSIGNEE))
+    assert mine["mine"] is True and theirs["mine"] is False
+    assert "owner_id" not in mine and "owner_id" not in theirs
+    assert theirs["workflow_name"] == "Devis"
+
+
+def test_the_assignee_does_not_receive_the_error_detail():
+    chunk = 'data: {"event": "error", "code": "x", "detail": "secret du proprio"}\n\n'
+    event = json.loads(api_runs()._for_assignee(chunk, ASSIGNEE)[len("data: "):])
+    assert event == {"event": "error", "code": "x"}
+
+
+def api_runs():
+    from apowerb.routers import workflows
+
+    return workflows
+
+
+@pytest.mark.asyncio
+async def test_a_decision_taken_by_a_lost_claim_does_not_run_on(api, monkeypatch):
+    from apowerb.core import workflow_runtime
+
+    ran = []
+    real = workflow_runtime.bindings_for
+
+    def _bindings(owner, plan):
+        agent, tool, rag, notify = real(owner, plan)
+        # Entre la prise et la décision, la réservation a été perdue (remise
+        # en attente puis reprise ailleurs) : la ligne n'est plus la nôtre.
+        t = run_main.run_store.run_table
+        with run_main.run_store.engine.begin() as conn:
+            conn.execute(t.update().values(resumed_at="2026-01-02 00:00:00.000000"))
+
+        async def _agent(agent_id, message):
+            ran.append(agent_id)
+            return "fait"
+
+        return _agent, tool, rag, notify
+
+    monkeypatch.setattr(workflow_runtime, "bindings_for", _bindings)
+    wf = workflow_main.create_workflow(owner_id=OWNER, name="Devis", graph=_graph_with_agent_after())
+    events = await _drain(
+        await api.defs.run_workflow(wf["workflow_id"], api.defs.RunBody(payload={"x": 1}), current_user=_user())
+    )
+    run_id = events[0]["wid"]
+    resumed = await _drain(await _resume(api, run_id, choice="oui"))
+    assert resumed[-1]["event"] == "error"
+    assert resumed[-1]["code"] == "decision_already_answered"
+    assert ran == []
+    t = run_main.run_store.run_table
+    with run_main.run_store.engine.begin() as conn:
+        row = conn.execute(t.select().where(t.c.run_id == run_id)).fetchone()._asdict()
+    # La ligne appartient à l'autre reprise : ni close, ni remise en attente.
+    assert row["status"] == "running" and row["paused_state"]
+
+
+@pytest.mark.asyncio
+async def test_the_assignee_is_told_the_decision_expired_not_that_it_is_unknown(api):
+    _, events = await _paused(api, assignee=ASSIGNEE)
+    run_id = events[0]["wid"]
+    _expire(run_id)
+    with pytest.raises(HTTPException) as exc:
+        await _resume(api, run_id, user=ASSIGNEE, choice="oui")
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "decision_expired"
+    # Un tiers ne l'apprend pas pour autant.
+    with pytest.raises(HTTPException) as other:
+        await _resume(api, run_id, user=STRANGER, choice="oui")
+    assert other.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_state_sealed_with_another_key_closes_the_run_with_a_coded_refusal(api):
+    from cryptography.fernet import Fernet
+
+    _, events = await _paused(api, assignee=ASSIGNEE)
+    run_id = events[0]["wid"]
+    # ENCRYPT_KEY changée depuis la pause : l'instantané n'est plus lisible.
+    foreign = Fernet(Fernet.generate_key()).encrypt(b'{"node_id": "d"}').decode()
+    t = run_main.run_store.run_table
+    with run_main.run_store.engine.begin() as conn:
+        conn.execute(t.update().where(t.c.run_id == run_id).values(paused_state=foreign))
+    for _ in range(2):
+        with pytest.raises(HTTPException) as exc:
+            await _resume(api, run_id, user=ASSIGNEE, choice="oui")
+        assert exc.value.status_code == 409
+        assert exc.value.detail["code"] == "decision_state_unreadable"
+    run = run_main.get_run(run_id, owner_id=OWNER)
+    assert run["status"] == "error" and "illisible" in run["error_message"]
+    assert _stored_state(run_id) is None
+    assert await api.runs.list_awaiting_runs(current_user=_user()) == []
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_resumed_run_interrupts_the_node_in_progress(api, monkeypatch):
+    import asyncio
+
+    from apowerb.core import workflow_runtime
+
+    started, interrupted = asyncio.Event(), []
+
+    async def _slow_agent(agent_id, message):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            interrupted.append(agent_id)
+            raise
+
+    async def _unused(*args, **kwargs):  # pragma: no cover
+        raise AssertionError("non appelé")
+
+    monkeypatch.setattr(
+        workflow_runtime, "bindings_for", lambda owner, plan: (_slow_agent, _unused, _unused, _unused)
+    )
+    graph = _graph()
+    graph["nodes"][2] = {"id": "yes", "type": "agent", "config": {"agent_id": "agent1"}}
+    wf = workflow_main.create_workflow(owner_id=OWNER, name="Lent", graph=graph)
+    events = await _drain(
+        await api.defs.run_workflow(
+            wf["workflow_id"], api.defs.RunBody(payload={"x": "devis"}), current_user=_user()
+        )
+    )
+    run_id = events[0]["wid"]
+    response = await _resume(api, run_id, choice="oui")
+    await asyncio.wait_for(started.wait(), 5)
+    # Arrêter, pas fermer l'onglet : le nœud en cours est interrompu.
+    await api.runs.cancel_workflow(run_id, current_user=_user())
+    resumed = await asyncio.wait_for(_drain(response), 5)
+    await asyncio.gather(*list(api.runs._detached_runs), return_exceptions=True)
+    assert interrupted == ["agent1"]
+    assert resumed[-1] == {"event": "cancelled"}
+    assert run_main.get_run(run_id, owner_id=OWNER)["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_only_the_owner_can_stop_a_resumed_run(api):
+    _, events = await _paused(api, assignee=ASSIGNEE)
+    run_id = events[0]["wid"]
+    response = await _resume(api, run_id, user=ASSIGNEE, choice="oui")
+    with pytest.raises(HTTPException) as exc:
+        await api.runs.cancel_workflow(run_id, current_user=_user(ASSIGNEE))
+    assert exc.value.status_code == 403
+    resumed = await _drain(response)
+    assert resumed[-1]["event"] == "done"
+    assert run_main.get_run(run_id, owner_id=OWNER)["status"] == "success"

@@ -754,6 +754,27 @@ def _running_is_orphaned(row: dict, *, now: datetime) -> bool:
     return (now - started) > _RUNNING_STALE_AFTER
 
 
+def _last_run_still_open(row: dict) -> bool:
+    """``last_status`` est figé à la pause : seule la ligne du run dit s'il
+    attend encore ou tourne de nouveau après sa reprise. ``get_run`` règle
+    d'abord une reprise morte (âge compté depuis la reprise) : ``running``
+    veut donc dire un run réellement en vol. Fini, abandonné ou expiré, il ne
+    bloque plus rien."""
+    from apowerb.core import run_main
+
+    if not row.get("last_run_id"):
+        return False
+    try:
+        run = run_main.get_run(row["last_run_id"], owner_id=row.get("owner_id"))
+    except Exception:
+        logger.warning(
+            "[triggers] get_run indisponible pour run=%s — créneau sauté par prudence",
+            row.get("last_run_id"),
+        )
+        return True
+    return (run or {}).get("status") in (run_main.STATUS_AWAITING, run_main.STATUS_RUNNING)
+
+
 async def fire_schedule_trigger(row: dict, *, now: datetime) -> bool:
     """Un tick pour UN trigger ``schedule`` échu. Renvoie si un run a démarré.
 
@@ -799,6 +820,21 @@ async def fire_schedule_trigger(row: dict, *, now: datetime) -> bool:
                 workflow_id, next_run_at=_iso_or_none(compute_next_run(cfg, after=now))
             )
             return False
+
+    if row.get("last_status") == "awaiting" and _last_run_still_open(row):
+        # Le run précédent attend une décision humaine, ou tourne de nouveau
+        # depuis qu'on y a répondu : sans ce garde, chaque créneau en
+        # empilerait un nouveau. Le créneau est consommé.
+        logger.info(
+            "[triggers] tick sauté (run précédent en attente de décision ou repris) "
+            "workflow=%s run=%s",
+            workflow_id,
+            row.get("last_run_id"),
+        )
+        _update_trigger_row(
+            workflow_id, next_run_at=_iso_or_none(compute_next_run(cfg, after=now))
+        )
+        return False
 
     next_at = _iso_or_none(compute_next_run(cfg, after=now))
     t = workflow_trigger_store.trigger_table
