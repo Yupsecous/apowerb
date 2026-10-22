@@ -7,7 +7,15 @@ décrit des clés et des types, JAMAIS des valeurs :
 * ``{"type": "string" | "number" | "boolean" | "null" | "any"}`` ;
 * ``{"type": "object", "fields": {clé: forme}}`` (``fields`` absent si
   inconnu, ``truncated: true`` si des clés ont été écartées) ;
-* ``{"type": "array", "items": forme}`` (``items`` absent si inconnu).
+* ``{"type": "array", "items": forme}`` (``items`` absent si inconnu) ;
+* ``{"type": "map", "values": forme}`` : un dict dont aucune clé n'est un nom
+  de champ (indexé par des e-mails, des numéros, des noms…).
+
+Seule une clé « de programmeur » (``total``, ``createdAt``, ``q1_total``)
+devient un nom de champ. Toute autre clé est une donnée : elle n'est jamais
+retenue, sa valeur est décrite sans elle (``others`` à côté de ``fields``
+dans un objet mixte, ou une ``map``). C'est une liste blanche : une forme de
+donnée imprévue ne peut pas passer pour un nom de champ.
 
 Deux sources : la configuration du graphe (``node_shapes``, pure) et la
 réponse des outils au dernier run de l'utilisateur (``record_tool_shape``),
@@ -16,13 +24,16 @@ car le catalogue des outils décrit leurs arguments, pas leur réponse.
 Stockage des formes apprises : une ligne par (utilisateur, outil) dans
 ``workflow_tool_shapes``, à côté des workflows (même base, même création
 idempotente au démarrage). La forme seule est écrite, plafonnée à
-``MAX_SHAPE_BYTES`` : rien d'une valeur de réponse n'atteint la base.
+``MAX_SHAPE_BYTES`` : rien d'une valeur de réponse n'atteint la base. Les
+formes d'un outil sont oubliées quand plus aucun workflow de l'utilisateur
+ne s'en sert (``forget_unused_tool_shapes``, à la suppression d'un workflow).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
@@ -42,6 +53,15 @@ MAX_DEPTH = 6
 MAX_KEYS = 50
 MAX_SHAPE_BYTES = 8_000
 MAX_TOOL_REF = 200
+# Un nom de champ : lettres, chiffres et ``_``, au plus un chiffre
+# (``item2``, ``q1_total``). Le reste (``C42``, ``client_CF101197``,
+# ``Dupont Jean``, ``user:42``…) est une donnée.
+_FIELD_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+MAX_KEY_DIGITS = 1
+
+
+def _is_field_key(key: str) -> bool:
+    return bool(_FIELD_KEY.fullmatch(key)) and sum(c.isdigit() for c in key) <= MAX_KEY_DIGITS
 
 _ANY = {"type": "any"}
 _STRING = {"type": "string"}
@@ -91,14 +111,22 @@ def shape_of(value: Any, *, max_depth: int = MAX_DEPTH) -> dict:
         if max_depth <= 0:
             return dict(_OBJECT)
         keys = [k for k in value if isinstance(k, str)]
+        named = [k for k in keys if _is_field_key(k)]
+        data_keys = [k for k in keys if not _is_field_key(k)]
+        # Les clés-données ne sont pas écrites : la première valeur les décrit.
+        others = shape_of(value[data_keys[0]], max_depth=max_depth - 1) if data_keys else None
+        if others is not None and not named:
+            return {"type": "map", "values": others}
         shape: dict = {
             "type": "object",
             "fields": {
-                k: shape_of(value[k], max_depth=max_depth - 1) for k in keys[:MAX_KEYS]
+                k: shape_of(value[k], max_depth=max_depth - 1) for k in named[:MAX_KEYS]
             },
         }
-        if len(keys) > MAX_KEYS:
+        if len(named) > MAX_KEYS:
             shape["truncated"] = True
+        if others is not None:
+            shape["others"] = others
         return shape
     if isinstance(value, (list, tuple)):
         if max_depth <= 0 or not value:
@@ -118,9 +146,17 @@ def capped_shape(value: Any) -> dict:
 
 def _at_path(shape: Optional[dict], path: str) -> dict:
     for part in (p for p in path.split(".") if p):
-        if not shape or shape.get("type") != "object" or part not in shape.get("fields", {}):
+        if shape and shape.get("type") == "map":
+            shape = shape.get("values")  # n'importe quelle clé de la table
+            continue
+        if not shape or shape.get("type") != "object":
             return dict(_ANY)
-        shape = shape["fields"][part]
+        if part in shape.get("fields", {}):
+            shape = shape["fields"][part]
+        elif "others" in shape:
+            shape = shape["others"]  # une clé-donnée de l'objet
+        else:
+            return dict(_ANY)
     return shape or dict(_ANY)
 
 
@@ -262,6 +298,45 @@ def read_tool_shapes(owner_id: str, tool_refs: Iterable[str]) -> dict[str, dict]
     query = t.select().where(t.c.owner_id == owner_id, t.c.tool_ref.in_(refs))
     with workflow_store.engine.begin() as conn:
         return {r.tool_ref: json.loads(r.shape) for r in conn.execute(query)}
+
+
+def tool_refs_in(graph: Any) -> set[str]:
+    """Les outils qu'un graphe appelle, corps de boucle et de ``try`` compris."""
+    if isinstance(graph, str):
+        try:
+            graph = json.loads(graph)
+        except ValueError:
+            return set()
+    found: set[str] = set()
+
+    def _walk(item: Any) -> None:
+        if isinstance(item, dict):
+            ref = (item.get("config") or {}).get("tool") if item.get("type") == "tool" else None
+            if isinstance(ref, str) and ref:
+                found.add(ref)
+            for v in item.values():
+                _walk(v)
+        elif isinstance(item, list):
+            for v in item:
+                _walk(v)
+
+    _walk(graph)
+    return found
+
+
+def forget_unused_tool_shapes(conn, owner_id: str, candidates: set[str]) -> None:
+    """Oublie les formes de ``candidates`` dont plus aucun workflow (ni révision)
+    de ``owner_id`` ne se sert. À appeler dans la transaction qui supprime."""
+    if not candidates:
+        return
+    still_used: set[str] = set()
+    for table in (workflow_store.workflow_table, workflow_store.revision_table):
+        for row in conn.execute(table.select().where(table.c.owner_id == owner_id)):
+            still_used |= tool_refs_in(row._mapping["graph"])
+    gone = sorted(candidates - still_used)
+    if gone:
+        t = workflow_store.tool_shape_table
+        conn.execute(t.delete().where(t.c.owner_id == owner_id, t.c.tool_ref.in_(gone)))
 
 
 RunTool = Callable[[str, dict], Awaitable[Any]]
