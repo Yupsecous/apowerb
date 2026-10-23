@@ -38,6 +38,15 @@ Types de nœuds :
   routes déjà prises) à ``on_await``, et ``run_graph(resume=...)`` rejoue les
   nœuds faits sans les réexécuter (``replayed``). Refusé dans le corps d'un
   ``loop``/``try`` et dans un sous-workflow (``approval_nested``).
+* ``file`` — produit un fichier (csv, xlsx, json, markdown, text, docx, pdf)
+  à partir d'un gabarit (``content``), le confie à ``services.save_file``
+  (référence opaque ``att_`` du propriétaire) et rend
+  ``{name, ref, size, content_type, format, rows}`` ; borné en taille
+  (``MAX_FILE_BYTES``) et en lignes (``MAX_FILE_ROWS``), jamais d'octets dans
+  la sortie ni dans les événements.
+* ``file_save`` — dépose un fichier produit (sa ref) dans le stockage du
+  propriétaire (OneDrive pour l'instant) via ``services.save_to_drive`` et
+  l'intégration déjà connectée : aucun identifiant dans le graphe.
 
 Gestion d'erreur par nœud (``on_error``, sur les nœuds qui peuvent
 échouer : ``_ON_ERROR_TYPES``) : ``fail`` (défaut) arrête le run ;
@@ -107,6 +116,7 @@ from google.genai import types
 from pydantic import BaseModel, Field, model_validator
 
 from apowerb.configs.th2logger import setup_logging
+from apowerb.core import workflow_files
 from apowerb.core.workflow_engine import (
     AgentReply,
     _Finished,
@@ -142,6 +152,8 @@ NodeType = Literal[
     "notification",
     "document",
     "db_write",
+    "file",
+    "file_save",
 ]
 CONVERT_TARGETS = ("text", "json", "number", "boolean", "list", "csv", "date")
 EXTRACT_FIELD_TYPES = ("string", "number", "boolean", "list", "object")
@@ -274,6 +286,35 @@ MAX_HTTP_REDIRECTS = 5
 # --- Nœud notification --------------------------------------------------------
 _NOTIF_CHANNELS = {"email", "app", "teams"}
 MAX_NOTIFICATION_RECIPIENTS = 10
+# Pièces jointes d'un email : des refs de fichiers produits (nœud file) ou
+# reçus (trigger email), résolues pour le propriétaire seulement.
+MAX_NOTIFICATION_ATTACHMENTS = 5
+
+# --- Nœuds file et file_save --------------------------------------------------
+FILE_FORMATS = tuple(workflow_files.FORMATS)
+MAX_FILE_BYTES = 5 * 1024 * 1024
+MAX_FILE_ROWS = 10_000
+# Word et PDF : texte borné en caractères (et en lignes, plus bas).
+MAX_FILE_TEXT_CHARS = 200_000
+# Bornées avant construction : des objets aux clés toutes différentes
+# multiplient les colonnes, donc les cellules.
+MAX_FILE_COLUMNS = 1_000
+MAX_FILE_CELLS = 500_000
+# Une valeur non textuelle est écrite en JSON indenté : l'indentation croît
+# avec la profondeur, bornée avant toute sérialisation.
+MAX_FILE_DEPTH = 50
+# Word et PDF : tableaux Markdown (Word plafonne à 63 colonnes) et lignes
+# (le rendu PDF coûte surtout à la ligne : ≈ 5 s pour 2 000 lignes).
+MAX_DOC_TABLE_COLUMNS = 63
+MAX_DOC_TABLE_CELLS = 20_000
+MAX_FILE_TEXT_LINES = 2_000
+MAX_FILE_NAME = 120
+# Règles d'Excel pour un nom de feuille.
+_SHEET_FORBIDDEN = re.compile(r"[\[\]:*?/\\]")
+MAX_SHEET_NAME = 31
+FILE_SAVE_PROVIDERS = ("onedrive",)
+_FILE_SAVE_CONFLICTS = ("rename", "replace", "fail")
+MAX_FILE_FOLDER = 200
 
 RunAgent = Callable[[str, str], Awaitable[Any]]
 RunTool = Callable[[str, dict], Awaitable[Any]]
@@ -301,7 +342,11 @@ class NodeServices(BaseModel):
     * ``jev_classify(labels, text, instructions, min_confidence)`` ->
       ``{"label", "confidence", "uncertain", "best_guess"[, "usage"]}`` ;
     * ``db_write(connection, table, row)`` -> ``{"inserted"}`` : valeurs
-      liées, jamais concaténées dans le SQL.
+      liées, jamais concaténées dans le SQL ;
+    * ``save_file(name, content_type, data)`` -> ``{"name", "ref", "size",
+      "content_type"}`` : stocke un fichier produit pour le propriétaire ;
+    * ``save_to_drive(provider, ref, folder, conflict)`` -> ``{"name",
+      "path", "web_url"}`` : dépose la ref dans son stockage en ligne.
     """
 
     model_config = {"arbitrary_types_allowed": True}
@@ -309,6 +354,8 @@ class NodeServices(BaseModel):
     document: Optional[Callable[[str], Awaitable[dict]]] = None
     jev_classify: Optional[Callable[[dict, str, str, float], Awaitable[dict]]] = None
     db_write: Optional[Callable[[str, str, dict], Awaitable[dict]]] = None
+    save_file: Optional[Callable[[str, str, bytes], Awaitable[dict]]] = None
+    save_to_drive: Optional[Callable[[str, str, str, str], Awaitable[dict]]] = None
 
 
 class UpstreamArgs(dict):
@@ -1261,6 +1308,8 @@ _FIXED_OUTPUT_KEYS = {
     "notification": {"channel", "sent"},
     "document": {"documents", "text", "count"},
     "db_write": {"table", "inserted"},
+    "file": {"name", "ref", "size", "content_type", "format", "rows"},
+    "file_save": {"provider", "name", "path", "web_url"},
     "approval": {"choice", "text", "answered_by", "answered_at"},
 }
 
@@ -1627,6 +1676,10 @@ def validate_node(
             )
     if n.type == "db_write":
         _validate_db_write(n)
+    if n.type == "file":
+        _validate_file(n)
+    if n.type == "file_save":
+        _validate_file_save(n)
     if n.type == "tool" and not cfg.get("tool"):
         raise GraphError(f"{n.id} : outil manquant")
     _validate_error_handling(n)
@@ -1746,6 +1799,21 @@ def validate_node(
                 f"(attendu : {', '.join(sorted(_NOTIF_CHANNELS))})"
             )
         to = cfg.get("to") or []
+        attachments = cfg.get("attachments")
+        if attachments not in (None, "", []):
+            if channel != "email":
+                raise GraphError(
+                    f"{n.id} : seules les notifications email ont des pièces jointes",
+                    code="notification_attachments_email_only",
+                    params={"node": n.id},
+                )
+            if not isinstance(attachments, (str, list)):
+                raise GraphError(
+                    f"{n.id} : attachments doit être un gabarit (ex. {{{{file1}}}}) "
+                    "ou une liste de gabarits",
+                    code="notification_attachment_bad_ref",
+                    params={"node": n.id},
+                )
         if channel == "email":
             if (
                 not isinstance(to, list)
@@ -1867,6 +1935,244 @@ def _validate_approval(n: Node) -> None:
             code="approval_choice_duplicate",
             params={"node": n.id, "route": dupes[0]},
         )
+
+
+def _validate_file(n: Node) -> None:
+    cfg = n.config
+    fmt = cfg.get("format")
+    if fmt not in FILE_FORMATS:
+        raise GraphError(
+            f"{n.id} : format de fichier inconnu {fmt!r} "
+            f"(attendu : {', '.join(FILE_FORMATS)})",
+            code="file_format_unknown",
+            params={"node": n.id, "value": str(fmt)},
+        )
+    content = cfg.get("content")
+    if content is None or (isinstance(content, str) and not content.strip()):
+        raise GraphError(
+            f"{n.id} : contenu du fichier manquant (ex. {{{{agent1}}}})",
+            code="file_content_missing",
+            params={"node": n.id},
+        )
+    name = cfg.get("filename")
+    if name is not None and (not isinstance(name, str) or len(name) > MAX_FILE_NAME):
+        raise GraphError(
+            f"{n.id} : nom de fichier invalide (texte de {MAX_FILE_NAME} caractères au plus)",
+            code="file_filename_invalid",
+            params={"node": n.id, "max": str(MAX_FILE_NAME)},
+        )
+    sheet = cfg.get("sheet_name")
+    if sheet not in (None, "") and (
+        not isinstance(sheet, str)
+        or len(sheet) > MAX_SHEET_NAME
+        or _SHEET_FORBIDDEN.search(sheet)
+    ):
+        raise GraphError(
+            f"{n.id} : nom de feuille invalide (31 caractères au plus, sans [ ] : * ? / \\)",
+            code="file_sheet_invalid",
+            params={"node": n.id},
+        )
+
+
+def _check_folder(node_id: str, folder: Any) -> str:
+    """Le dossier de destination, sans remontée ni chemin absolu détourné."""
+    if folder is None:
+        return ""
+    if not isinstance(folder, str):
+        folder = str(folder)
+    parts = [p for p in folder.strip().strip("/").split("/") if p.strip()]
+    if (
+        len(folder) > MAX_FILE_FOLDER
+        or "\\" in folder
+        or any(p.strip() in (".", "..") for p in parts)
+        or any(ord(c) < 32 for c in folder)
+    ):
+        raise GraphError(
+            f"{node_id} : dossier de destination invalide {folder[:80]!r} "
+            "(chemin relatif, sans .. ni \\)",
+            code="file_save_folder_invalid",
+            params={"node": node_id},
+        )
+    return "/".join(p.strip() for p in parts)
+
+
+def _validate_file_save(n: Node) -> None:
+    cfg = n.config
+    provider = cfg.get("provider")
+    if provider not in FILE_SAVE_PROVIDERS:
+        raise GraphError(
+            f"{n.id} : stockage inconnu {provider!r} "
+            f"(attendu : {', '.join(FILE_SAVE_PROVIDERS)})",
+            code="file_save_provider_unknown",
+            params={"node": n.id, "value": str(provider)},
+        )
+    file = cfg.get("file")
+    if not isinstance(file, str) or not file.strip():
+        raise GraphError(
+            f"{n.id} : fichier à déposer manquant (ex. {{{{file1}}}})",
+            code="file_save_file_missing",
+            params={"node": n.id},
+        )
+    conflict = cfg.get("conflict") or "rename"
+    if conflict not in _FILE_SAVE_CONFLICTS:
+        raise GraphError(
+            f"{n.id} : conflict inconnu {conflict!r} "
+            f"(attendu : {', '.join(_FILE_SAVE_CONFLICTS)})",
+            code="file_save_conflict_unknown",
+            params={"node": n.id, "value": str(conflict)},
+        )
+    folder = cfg.get("folder") or ""
+    if not _TEMPLATE.search(str(folder)):
+        _check_folder(n.id, folder)
+    else:
+        # Rendu à l'exécution, revérifié alors ; la partie écrite en dur ne
+        # peut déjà pas remonter.
+        _check_folder(n.id, _TEMPLATE.sub("x", str(folder)))
+
+
+def _file_refs(node_id: str, value: Any, *, code_prefix: str, limit: int) -> list[str]:
+    """Les refs désignées par ``value`` rendu : une ref, la sortie d'un nœud
+    ``file`` (``{"ref": …}``) ou une liste de l'un ou l'autre."""
+    items = value if isinstance(value, list) else [value]
+    items = [i for i in items if i not in (None, "")]
+    if len(items) > limit:
+        raise GraphError(
+            f"{node_id} : {len(items)} fichiers, max {limit}",
+            code=f"{code_prefix}_too_many_attachments",
+            params={"node": node_id, "max": str(limit)},
+        )
+    refs = []
+    for item in items:
+        ref = item.get("ref") if isinstance(item, dict) else item
+        if not isinstance(ref, str) or not ref.strip():
+            raise GraphError(
+                f"{node_id} : élément qui n'est pas un fichier (attendu : une ref "
+                "ou la sortie d'un nœud Fichier)",
+                code=f"{code_prefix}_attachment_bad_ref",
+                params={"node": node_id},
+            )
+        refs.append(ref.strip())
+    return refs
+
+
+def _bounded_file_text(node_id: str, fmt: str, value: Any) -> str:
+    """Le texte d'un fichier json, markdown, text, docx ou pdf, bornes
+    vérifiées avant de le produire en entier et avant tout rendu."""
+    if fmt == "json":
+        value = workflow_files.json_value(value)
+    if workflow_files.depth(value, MAX_FILE_DEPTH) > MAX_FILE_DEPTH:
+        raise GraphError(
+            f"{node_id} : valeur imbriquée sur plus de {MAX_FILE_DEPTH} niveaux",
+            code="file_too_deep",
+            params={"node": node_id, "max": str(MAX_FILE_DEPTH)},
+        )
+    rich = fmt in workflow_files.RICH_TEXT
+    # Un caractère vaut au moins un octet : la borne en octets reste vérifiée
+    # après coup, celle-ci évite seulement de produire au-delà.
+    limit = MAX_FILE_TEXT_CHARS if rich else MAX_FILE_BYTES
+    try:
+        text = workflow_files.bounded_text(value, limit, as_json=fmt == "json")
+    except workflow_files.TextTooLong:
+        if rich:
+            raise GraphError(
+                f"{node_id} : texte trop long pour un fichier {fmt} "
+                f"(max {MAX_FILE_TEXT_CHARS} caractères)",
+                code="file_text_too_long",
+                params={"node": node_id, "format": fmt, "max": str(MAX_FILE_TEXT_CHARS)},
+            ) from None
+        raise GraphError(
+            f"{node_id} : fichier de plus de {MAX_FILE_BYTES} octets",
+            code="file_too_large",
+            params={"node": node_id, "max": str(MAX_FILE_BYTES)},
+        ) from None
+    if not rich:
+        return text
+    # Compté sur le texte même que le rendu reçoit : sans caractères de
+    # contrôle (l'un d'eux couperait une ligne pour ``splitlines`` et cacherait
+    # un tableau), lignes découpées comme ``_docx`` (\r, \x0b… comptent).
+    text = workflow_files.strip_control(text)
+    if len(text.splitlines()) > MAX_FILE_TEXT_LINES:
+        raise GraphError(
+            f"{node_id} : plus de {MAX_FILE_TEXT_LINES} lignes de texte",
+            code="file_too_many_lines",
+            params={"node": node_id, "max": str(MAX_FILE_TEXT_LINES)},
+        )
+    widest, cells = workflow_files.markdown_tables(text)
+    if widest > MAX_DOC_TABLE_COLUMNS:
+        raise GraphError(
+            f"{node_id} : tableau de {widest} colonnes, max {MAX_DOC_TABLE_COLUMNS}",
+            code="file_too_many_columns",
+            params={"node": node_id, "max": str(MAX_DOC_TABLE_COLUMNS)},
+        )
+    if cells > MAX_DOC_TABLE_CELLS:
+        raise GraphError(
+            f"{node_id} : {cells} cellules de tableau, max {MAX_DOC_TABLE_CELLS}",
+            code="file_too_many_cells",
+            params={"node": node_id, "max": str(MAX_DOC_TABLE_CELLS)},
+        )
+    return text
+
+
+def _build_file(node_id: str, fmt: str, value: Any, sheet: Optional[str]) -> tuple:
+    """(octets, lignes) du fichier, bornes vérifiées avant toute cellule."""
+    table = None
+    if fmt in workflow_files.TABULAR:
+        try:
+            table = workflow_files.parse_table(value)
+        except workflow_files.RowsError as exc:
+            raise GraphError(
+                f"{node_id} : {fmt} attend une liste de lignes "
+                f"(objets, ou listes avec l'en-tête en premier) : {exc}",
+                code="file_bad_rows",
+                params={"node": node_id, "format": fmt},
+            ) from None
+        rows = len(table.records)
+        if rows > MAX_FILE_ROWS:
+            raise GraphError(
+                f"{node_id} : {rows} lignes, max {MAX_FILE_ROWS}",
+                code="file_too_many_rows",
+                params={"node": node_id, "max": str(MAX_FILE_ROWS)},
+            )
+        if table.width > MAX_FILE_COLUMNS:
+            raise GraphError(
+                f"{node_id} : {table.width} colonnes, max {MAX_FILE_COLUMNS}",
+                code="file_too_many_columns",
+                params={"node": node_id, "max": str(MAX_FILE_COLUMNS)},
+            )
+        if rows * table.width > MAX_FILE_CELLS:
+            raise GraphError(
+                f"{node_id} : {rows * table.width} cellules, max {MAX_FILE_CELLS}",
+                code="file_too_many_cells",
+                params={"node": node_id, "max": str(MAX_FILE_CELLS)},
+            )
+    text = None
+    if table is None:
+        text = _bounded_file_text(node_id, fmt, value)
+    try:
+        return workflow_files.build(fmt, value, sheet, table=table, text=text)
+    except Exception as exc:
+        # Type seulement : le message d'une bibliothèque de rendu peut citer
+        # le contenu d'une cellule.
+        logger.warning(
+            "[workflow file] %s : rendu %s impossible (%s)", node_id, fmt, type(exc).__name__
+        )
+        raise GraphError(
+            f"{node_id} : fichier {fmt} impossible à produire depuis ce contenu",
+            code="file_build_failed",
+            params={"node": node_id, "format": fmt},
+        ) from None
+
+
+def _file_name(node: Node, rendered: Any, fmt: str) -> str:
+    from apowerb.storage.filename import sanitize_filename
+
+    ext = workflow_files.FORMATS[fmt][0]
+    raw = rendered if isinstance(rendered, str) and rendered.strip() else node.id
+    name = sanitize_filename(raw.strip())
+    if name.lower().endswith(ext):
+        name = name[: -len(ext)]
+    name = name[: MAX_FILE_NAME - len(ext)].rstrip(" .") or node.id
+    return name + ext
 
 
 def _validate_classifier(n: Node) -> None:
@@ -2459,6 +2765,72 @@ class _Compiler:
         result = await write(cfg["connection"], cfg["table"], row)
         return {"table": cfg["table"], "inserted": result.get("inserted", 0)}
 
+    async def _make_file(self, node: Node) -> dict:
+        cfg = node.config
+        save = self._service(node, "save_file")
+        fmt = cfg["format"]
+        value = render(cfg["content"], self.outputs, node.id)
+        name = _file_name(node, render(cfg.get("filename"), self.outputs, node.id), fmt)
+        # Lecture, bornes et rendu hors de la boucle d'événements.
+        data, rows = await asyncio.to_thread(
+            _build_file, node.id, fmt, value, cfg.get("sheet_name") or None
+        )
+        if not data:
+            raise GraphError(
+                f"{node.id} : contenu vide, aucun fichier produit",
+                code="file_empty",
+                params={"node": node.id},
+            )
+        if len(data) > MAX_FILE_BYTES:
+            raise GraphError(
+                f"{node.id} : fichier de {len(data)} octets, max {MAX_FILE_BYTES}",
+                code="file_too_large",
+                params={"node": node.id, "max": str(MAX_FILE_BYTES)},
+            )
+        content_type = workflow_files.FORMATS[fmt][1]
+        stored = await save(name, content_type, data)
+        out = {
+            "name": stored.get("name", name),
+            "ref": stored["ref"],
+            "size": stored.get("size", len(data)),
+            "content_type": content_type,
+            "format": fmt,
+            "rows": rows,
+        }
+        self._artifacts[node.id] = [
+            {
+                "file_ref": out["ref"],
+                "file_name": out["name"],
+                "content_type": content_type,
+                "size": out["size"],
+            }
+        ]
+        return out
+
+    async def _save_to_drive(self, node: Node) -> dict:
+        cfg = node.config
+        save = self._service(node, "save_to_drive")
+        value = render(cfg["file"], self.outputs, node.id)
+        ref = value.get("ref") if isinstance(value, dict) else value
+        if not isinstance(ref, str) or not ref.strip():
+            raise GraphError(
+                f"{node.id} : ce n'est pas un fichier "
+                "(attendu : la sortie d'un nœud Fichier, ex. {{file1}})",
+                code="file_save_bad_file",
+                params={"node": node.id},
+            )
+        folder = _check_folder(node.id, render(cfg.get("folder") or "", self.outputs, node.id))
+        provider = cfg["provider"]
+        result = await save(
+            provider, ref.strip(), folder, cfg.get("conflict") or "rename"
+        )
+        return {
+            "provider": provider,
+            "name": result.get("name"),
+            "path": result.get("path"),
+            "web_url": result.get("web_url"),
+        }
+
     def _wrap(self, node: Node, body):
         async def _fn(node_input: Any) -> Any:
             if self.cancel.is_set():
@@ -2717,6 +3089,14 @@ class _Compiler:
 
             async def body(node_input):
                 return await self._db_write(node), None
+        elif node.type == "file":
+
+            async def body(node_input):
+                return await self._make_file(node), None
+        elif node.type == "file_save":
+
+            async def body(node_input):
+                return await self._save_to_drive(node), None
         elif node.type == "classifier":
 
             async def body(node_input):
@@ -2884,6 +3264,27 @@ class _Compiler:
                         code="notification_unavailable",
                         params={"node": node.id},
                     )
+                refs = []
+                if cfg.get("attachments") not in (None, "", []):
+                    refs = _file_refs(
+                        node.id,
+                        render(cfg["attachments"], self.outputs, node.id),
+                        code_prefix="notification",
+                        limit=MAX_NOTIFICATION_ATTACHMENTS,
+                    )
+                    if not refs:
+                        raise GraphError(
+                            f"{node.id} : pièces jointes demandées mais aucun fichier reçu",
+                            code="notification_attachment_missing",
+                            params={"node": node.id},
+                        )
+                if refs:
+                    # Mot-clé seulement s'il sert : les run_notify injectés
+                    # avant les pièces jointes gardent leur signature.
+                    sent = await self.run_notify(
+                        node.id, channel, to, subject, message, attachments=refs
+                    )
+                    return {"channel": channel, "sent": sent}, None
                 sent = await self.run_notify(node.id, channel, to, subject, message)
                 return {"channel": channel, "sent": sent}, None
         elif node.type == "loop":

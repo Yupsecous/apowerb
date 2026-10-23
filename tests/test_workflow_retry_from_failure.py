@@ -710,3 +710,41 @@ async def test_an_oversized_state_is_not_saved(api, monkeypatch):
     _, events = await _failed(api)
     assert events[-1]["event"] == "error" and events[-1]["retryable"] is False
     assert run_main.get_run(events[0]["wid"], owner_id=OWNER)["retry_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_files_made_before_the_failure_count_towards_the_run_limit(
+    api, monkeypatch, tmp_path
+):
+    """La limite de fichiers par run tient à travers « Reprendre ici » : les
+    fichiers rejoués ne sont pas reproduits, mais restent comptés."""
+    monkeypatch.setenv("TH2_ATTACHMENT_ROOT", str(tmp_path / "att"))
+    monkeypatch.setattr(workflow_runtime, "MAX_RUN_FILES", 2)
+
+    def _file(node_id):
+        return {"id": node_id, "type": "file", "config": {"format": "text", "content": "x"}}
+
+    graph = {
+        "version": 1,
+        "nodes": [
+            {"id": "t", "type": "trigger", "config": {"kind": "manual"}},
+            _file("f1"),
+            _file("f2"),
+            {"id": "a2", "type": "agent", "config": {"agent_id": "fautif", "input": "go"}},
+            _file("f3"),
+        ],
+        "edges": [
+            {"source": "t", "target": "f1"},
+            {"source": "f1", "target": "f2"},
+            {"source": "f2", "target": "a2"},
+            {"source": "a2", "target": "f3"},
+        ],
+    }
+    _, events = await _failed(api, graph=graph)
+    assert events[-1]["event"] == "error"
+    api.fail.clear()
+    resumed = await _drain(await _retry(api, events[0]["wid"]))
+    errors = [e for e in resumed if e["event"] == "node_error"]
+    assert [(e["node_id"], e.get("code")) for e in errors] == [("f3", "file_run_limit")]
+    # Rejoués, f1 et f2 n\x27ont pas été reproduits.
+    assert len(list((tmp_path / "att" / "workflow_generated").iterdir())) == 2

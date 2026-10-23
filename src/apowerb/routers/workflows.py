@@ -77,7 +77,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from nanoid import generate as nanoid_generate
 from pydantic import BaseModel, Field
 
@@ -325,7 +325,9 @@ async def _retry_runner(
         workflow_id=config["workflow_id"],
         cancel_event=cancel_event,
         run_notify=run_notify,
-        services=workflow_runtime.services_for(owner),
+        services=workflow_runtime.services_for(
+            owner, files_already=workflow_runtime.files_produced(state)
+        ),
         until=state.get("until"),
         # Sans ``answer`` : rien à décider, seulement l'amont à rejouer.
         resume={k: state.get(k) for k in workflow_graph.RESUME_KEYS},
@@ -443,7 +445,9 @@ async def _decision_resume_stream(
         workflow_id=claimed["run"]["config"].get("workflow_id"),
         cancel_event=cancel_event,
         run_notify=run_notify,
-        services=workflow_runtime.services_for(owner),
+        services=workflow_runtime.services_for(
+            owner, files_already=workflow_runtime.files_produced(state)
+        ),
         on_await=pause_saver(run_id),
         on_fail=failure_saver(run_id),
         resume={**state, "answer": claimed["answer"]},
@@ -905,6 +909,33 @@ async def render_preview(
             detail={"code": exc.code, "params": exc.params, "message": str(exc)},
         )
     return {"rendered": rendered}
+
+
+@router.get("/files/{ref}")
+async def download_workflow_file(
+    ref: str,
+    current_user: user_schemas.User = Depends(get_current_user),
+):
+    """Un fichier d'un run (produit par un nœud file, ou pièce jointe reçue),
+    pour son propriétaire seulement.
+
+    404 opaque pour une ref inconnue, invalide ou d'un autre compte : la route
+    ne confirme jamais l'existence du fichier d'autrui. Toujours servi en
+    pièce jointe, sans deviner le type (``nosniff``).
+    """
+    from apowerb.core import workflow_attachments
+
+    try:
+        meta = await asyncio.to_thread(workflow_attachments.resolve, ref, current_user.email)
+    except workflow_attachments.AttachmentError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fichier introuvable.") from None
+    return FileResponse(
+        meta["path"],
+        media_type=meta.get("content_type") or "application/octet-stream",
+        filename=meta["name"],
+        content_disposition_type="attachment",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
 
 
 _MAX_RUNS_PAGE = 200
