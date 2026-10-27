@@ -30,6 +30,12 @@ from apowerb.core.superagents import (
 )
 
 
+requires_scei_template = pytest.mark.skipif(
+    not any(t["template_id"] == "scei_ar_assistant" for t in SUPERAGENT_TEMPLATES),
+    reason="needs the scei_ar_assistant template, which the th2customers client overlay registers and this repository does not",
+)
+
+
 def _user(email: str | None) -> SimpleNamespace:
     """Minimal stand-in for the User pydantic model."""
     return SimpleNamespace(email=email)
@@ -102,6 +108,7 @@ class TestListVisibility:
         ids = {t["template_id"] for t in out}
         assert "scei_ar_assistant" not in ids
 
+    @requires_scei_template
     def test_scei_user_sees_scei_template(self):
         out = list_superagent_templates(user=_user("ops@scei88.fr"))
         ids = {t["template_id"] for t in out}
@@ -141,6 +148,7 @@ class TestGetVisibility:
         )
         assert out is None
 
+    @requires_scei_template
     def test_scei_user_gets_scei_template(self):
         out = get_superagent_template(
             "scei_ar_assistant", user=_user("ops@scei88.fr")
@@ -148,6 +156,7 @@ class TestGetVisibility:
         assert out is not None
         assert out["template_id"] == "scei_ar_assistant"
 
+    @requires_scei_template
     def test_legacy_signature_still_returns_template(self):
         """``user=None`` MUST keep returning the template — internal
         call sites (e.g. ``audio_stream``) rely on it."""
@@ -166,6 +175,7 @@ class TestGetVisibility:
 
 
 class TestSceiTemplateMarked:
+    @requires_scei_template
     def test_scei_template_carries_visible_to_orgs(self):
         scei = next(
             (t for t in SUPERAGENT_TEMPLATES if t["template_id"] == "scei_ar_assistant"),
