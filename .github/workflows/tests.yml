@@ -91,7 +91,6 @@ jobs:
             --ignore=tests/test_scheduled_emailing.py \
             --ignore=tests/test_callbacks.py \
             --ignore=tests/test_webhook_gmail_signature.py \
-            --ignore=tests/test_microsoft_token_refresh.py \
             --ignore=tests/test_audio_streaming.py \
             --ignore=tests/test_chat_action_tools.py
 
@@ -111,6 +110,5 @@ jobs:
             tests/test_scheduled_emailing.py \
             tests/test_callbacks.py \
             tests/test_webhook_gmail_signature.py \
-            tests/test_microsoft_token_refresh.py \
             tests/test_audio_streaming.py \
             tests/test_chat_action_tools.py
