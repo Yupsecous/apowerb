@@ -85,7 +85,6 @@ jobs:
             --ignore=tests/test_integration_token_encryption.py \
             --ignore=tests/test_template_drift.py \
             --ignore=tests/test_callback_wiring.py \
-            --ignore=tests/test_webhook_retrigger.py \
             --ignore=tests/test_tool_context_canonical.py \
             --ignore=tests/test_superagent_template_visibility.py \
             --ignore=tests/test_scheduled_emailing.py \
@@ -105,7 +104,6 @@ jobs:
             tests/test_integration_token_encryption.py \
             tests/test_template_drift.py \
             tests/test_callback_wiring.py \
-            tests/test_webhook_retrigger.py \
             tests/test_tool_context_canonical.py \
             tests/test_superagent_template_visibility.py \
             tests/test_scheduled_emailing.py \

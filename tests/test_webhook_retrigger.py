@@ -19,6 +19,7 @@ Cas couverts :
 
 from __future__ import annotations
 
+import importlib.util
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -422,6 +423,10 @@ def _ctx_mock():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("th2customers") is None,
+    reason="needs the th2customers client overlay, which is not in this repository",
+)
 class TestSceiMailDedup24h:
     def test_second_live_send_same_commande_within_24h_refused(self):
         """(f) 2e envoi live meme CommandeId <24h -> reason duplicate_within_24h."""
