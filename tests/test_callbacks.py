@@ -19,11 +19,17 @@ abort the SequentialAgent mid-pipeline)."""
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic import BaseModel
+
+requires_overlay = pytest.mark.skipif(
+    importlib.util.find_spec("th2customers") is None,
+    reason="needs the th2customers client overlay, which is not in this repository",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +454,7 @@ class TestAttachmentPdfGate:
         assert _is_pdf_attachment("not a dict") is False
         assert _is_pdf_attachment({"content_type": None, "filename": None}) is False
 
+    @requires_overlay
     def test_no_pdf_short_circuits_to_not_ar(self):
         from th2customers.scei.gates import build_attachment_pdf_gate_callback
 
@@ -463,6 +470,7 @@ class TestAttachmentPdfGate:
         assert payload["extraction_results"] == {}
         assert res is not None  # short-circuit content returned (skips LLM)
 
+    @requires_overlay
     def test_with_pdf_proceeds_to_llm(self):
         from th2customers.scei.gates import build_attachment_pdf_gate_callback
 
@@ -476,6 +484,7 @@ class TestAttachmentPdfGate:
         assert res is None  # PDF present -> let the LLM run
         assert "ar_intake" not in ctx.state
 
+    @requires_overlay
     def test_no_attachments_key_is_not_ar(self):
         from th2customers.scei.gates import build_attachment_pdf_gate_callback
 
@@ -485,6 +494,7 @@ class TestAttachmentPdfGate:
         cb(callback_context=ctx)
         assert json.loads(ctx.state["ar_intake"])["email_classification"] == "not_ar"
 
+    @requires_overlay
     def test_written_payload_revalidates(self):
         """The short-circuit JSON must be a valid SCEIIntakePayload (the
         downstream contract)."""
