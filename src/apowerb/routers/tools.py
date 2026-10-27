@@ -1,3 +1,13 @@
+"""Tools and MCP server configuration, under ``/tools``, ``/tools_config`` and ``/mcp_configs``.
+
+``/tools`` lists the available tools, their documentation (``/tools/docs``) and
+the parameters each one expects (``/tools/{tool_name}/params``). ``/tools_config``
+creates, reads, updates and deletes tool configurations, and ``/mcp_configs`` does
+the same for the current user's MCP server configurations, with
+``POST /mcp_configs/reload`` regenerating the dynamic toolbox config and
+restarting the toolbox.
+"""
+
 import json
 import os
 import signal

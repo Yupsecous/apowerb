@@ -1,3 +1,12 @@
+"""Read-only OneDrive browser for the web UI, mounted under ``/api/onedrivebrowser``.
+
+It lists (``/list``) and searches (``/search``) the connected user's OneDrive
+files, returns a file's contents as a base64 data URI for chat attachments
+(``/content``) and previews the columns of an Excel or CSV file
+(``/excel-preview``). Authentication and Microsoft Graph access go through the
+``onedrive_core`` helpers.
+"""
+
 from __future__ import annotations
 
 import asyncio
