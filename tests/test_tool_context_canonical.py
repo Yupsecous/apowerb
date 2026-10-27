@@ -21,8 +21,16 @@ These tests guard the regression:
 
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import typing
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("th2customers") is None,
+    reason="needs the th2customers client overlay, which is not in this repository",
+)
 
 
 def test_module_imports_without_toolcontext_nameerror():
