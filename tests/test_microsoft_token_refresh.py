@@ -17,6 +17,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from cryptography.fernet import Fernet
 
 from apowerb.helpers.encryptor import decrypt_value, encrypt_value
 from apowerb.integrations.microsoft import (
@@ -25,6 +26,15 @@ from apowerb.integrations.microsoft import (
     _decode_jwt_exp,
     is_access_token_expired,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fernet(monkeypatch):
+    """The stored tokens are Fernet-encrypted: give the encryptor a key of its
+    own so the tests do not depend on ``ENCRYPT_KEY`` being exported."""
+    monkeypatch.setattr(
+        "apowerb.helpers.encryptor.fernet", Fernet(Fernet.generate_key())
+    )
 
 
 def _make_jwt(claims: dict) -> str:
@@ -148,10 +158,10 @@ class TestGetValidAccessToken:
     @pytest.mark.asyncio
     async def test_expired_without_refresh_token_raises(self):
         expired = _make_jwt({"exp": int(time.time()) - 3600})
-        integ = MagicMock(access_token=expired, refresh_token="")
+        integ = MagicMock(access_token=encrypt_value(expired), refresh_token="")
         db = _db_with_integration(integ)
 
-        with pytest.raises(IntegrationTokenExpiredError):
+        with pytest.raises(IntegrationTokenExpiredError, match="no refresh token"):
             await MicrosoftIntegrationService.get_valid_access_token(
                 db, user_id=1, service="outlook"
             )
