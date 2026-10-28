@@ -1,4 +1,4 @@
-"""Skills catalogue and management, under ``/skills``.
+"""Skills catalogue and management, under ``/api/skills``.
 
 It lists all skills, meaning the built-in portfolio plus the custom skills of the
 caller's organisation, and the portfolio alone (``/skills/portfolio``). Skills can

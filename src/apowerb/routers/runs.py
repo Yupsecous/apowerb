@@ -1,4 +1,4 @@
-"""Start and inspect agent runs, under ``/agents/{agent_id}``.
+"""Start and inspect agent runs, under ``/api/agents/{agent_id}``.
 
 ``POST /agents/{agent_id}/run`` starts the agent in a background thread and
 ``GET /agents/{agent_id}/status`` reports whether that thread is still alive.

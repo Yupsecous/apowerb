@@ -1,9 +1,10 @@
-"""Shareable snapshots of a conversation, under ``/conversations/share``.
+"""Shareable snapshots of a conversation, under ``/api/conversations/share``.
 
 ``POST`` creates a snapshot owned by the caller, valid for 30 days, and returns
 its share id; ``GET`` lists the caller's own snapshots; ``GET /{share_id}`` opens
-one (anyone with the id for a public snapshot, only the owner otherwise, and an
-expired one answers 410); ``DELETE /{share_id}`` revokes it.
+one (anyone with the id for a public snapshot; a private one needs a signed-in
+user and answers 403 when it belongs to someone else; an expired one answers
+410); ``DELETE /{share_id}`` revokes it.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status

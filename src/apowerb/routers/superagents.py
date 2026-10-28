@@ -1,4 +1,4 @@
-"""SuperAgent templates, under ``/superagents``.
+"""SuperAgent templates, under ``/api/superagents``.
 
 ``GET /superagents`` lists the templates visible to the caller and
 ``GET /superagents/{template_id}`` returns one. Templates restricted to other

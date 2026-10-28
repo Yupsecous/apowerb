@@ -1,4 +1,4 @@
-"""Catalogue of the LLM models the UI can offer, served under ``/models``.
+"""Catalogue of the LLM models the UI can offer, served under ``/api/models``.
 
 ``GET /models`` groups the models declared in ``apowerb.configs.models`` by
 provider. When the server has a shared default LLM configured, that one is put

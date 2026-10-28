@@ -1,4 +1,4 @@
-"""Pipelines, schedules and runs of the external orchestrator, under ``/pipelines``.
+"""Pipelines, schedules and runs of the external orchestrator, under ``/api/pipelines``.
 
 The router lists pipelines, registers agent triggers
 (``POST /pipelines/agents/triggers``), lists and updates the schedules of the
