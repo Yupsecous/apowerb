@@ -22,18 +22,29 @@ from types import SimpleNamespace
 import pytest
 
 from apowerb.configs.settings import get_settings
+from apowerb.core.extensions.registry import registry
 from apowerb.core.superagents import (
-    SUPERAGENT_TEMPLATES,
+    _build_templates,
     _user_org_slugs,
     get_superagent_template,
     list_superagent_templates,
 )
 
 
-requires_scei_template = pytest.mark.skipif(
-    not any(t["template_id"] == "scei_ar_assistant" for t in SUPERAGENT_TEMPLATES),
-    reason="needs the scei_ar_assistant template, which the th2customers client overlay registers and this repository does not",
-)
+RESTRICTED_ID = "org_restricted_template"
+
+
+@pytest.fixture
+def restricted_template(monkeypatch):
+    """A template restricted to the ``scei`` org, registered the way an overlay
+    registers its own, so the visibility rules run without the overlay."""
+    template = {
+        "template_id": RESTRICTED_ID,
+        "display_name": "Org restricted template (test)",
+        "visible_to_orgs": ["scei"],
+    }
+    monkeypatch.setattr(registry, "_templates", [*registry.templates(), template])
+    return template
 
 
 def _user(email: str | None) -> SimpleNamespace:
@@ -97,22 +108,21 @@ class TestListVisibility:
     def test_none_user_returns_full_catalog(self):
         """Internal / system callers (no auth) keep seeing everything."""
         out = list_superagent_templates(user=None)
-        assert len(out) == len(SUPERAGENT_TEMPLATES)
+        assert len(out) == len(_build_templates())
 
     def test_no_arg_defaults_to_full_catalog(self):
         """Backward compatibility — pre-existing call sites pass no user."""
-        assert len(list_superagent_templates()) == len(SUPERAGENT_TEMPLATES)
+        assert len(list_superagent_templates()) == len(_build_templates())
 
-    def test_non_scei_user_does_not_see_scei_template(self):
+    def test_non_scei_user_does_not_see_restricted_template(self, restricted_template):
         out = list_superagent_templates(user=_user("alice@example.com"))
         ids = {t["template_id"] for t in out}
-        assert "scei_ar_assistant" not in ids
+        assert RESTRICTED_ID not in ids
 
-    @requires_scei_template
-    def test_scei_user_sees_scei_template(self):
+    def test_scei_user_sees_restricted_template(self, restricted_template):
         out = list_superagent_templates(user=_user("ops@scei88.fr"))
         ids = {t["template_id"] for t in out}
-        assert "scei_ar_assistant" in ids
+        assert RESTRICTED_ID in ids
 
     def test_unrestricted_templates_visible_to_everyone(self):
         """Every template without ``visible_to_orgs`` must appear for
@@ -120,7 +130,7 @@ class TestListVisibility:
         existing catalog when introducing the filter."""
         unrestricted = [
             t["template_id"]
-            for t in SUPERAGENT_TEMPLATES
+            for t in _build_templates()
             if t.get("visible_to_orgs") is None
         ]
         assert unrestricted, "expected at least some unrestricted templates"
@@ -142,27 +152,21 @@ class TestListVisibility:
 
 
 class TestGetVisibility:
-    def test_non_scei_user_gets_none_for_scei_template(self):
-        out = get_superagent_template(
-            "scei_ar_assistant", user=_user("alice@example.com")
-        )
+    def test_non_scei_user_gets_none_for_restricted_template(self, restricted_template):
+        out = get_superagent_template(RESTRICTED_ID, user=_user("alice@example.com"))
         assert out is None
 
-    @requires_scei_template
-    def test_scei_user_gets_scei_template(self):
-        out = get_superagent_template(
-            "scei_ar_assistant", user=_user("ops@scei88.fr")
-        )
+    def test_scei_user_gets_restricted_template(self, restricted_template):
+        out = get_superagent_template(RESTRICTED_ID, user=_user("ops@scei88.fr"))
         assert out is not None
-        assert out["template_id"] == "scei_ar_assistant"
+        assert out["template_id"] == RESTRICTED_ID
 
-    @requires_scei_template
-    def test_legacy_signature_still_returns_template(self):
+    def test_legacy_signature_still_returns_template(self, restricted_template):
         """``user=None`` MUST keep returning the template — internal
         call sites (e.g. ``audio_stream``) rely on it."""
-        out = get_superagent_template("scei_ar_assistant")
+        out = get_superagent_template(RESTRICTED_ID)
         assert out is not None
-        assert out["template_id"] == "scei_ar_assistant"
+        assert out["template_id"] == RESTRICTED_ID
 
     def test_unknown_id_returns_none(self):
         out = get_superagent_template("nope", user=_user("alice@example.com"))
@@ -175,13 +179,16 @@ class TestGetVisibility:
 
 
 class TestSceiTemplateMarked:
-    @requires_scei_template
     def test_scei_template_carries_visible_to_orgs(self):
         scei = next(
-            (t for t in SUPERAGENT_TEMPLATES if t["template_id"] == "scei_ar_assistant"),
+            (t for t in _build_templates() if t["template_id"] == "scei_ar_assistant"),
             None,
         )
-        assert scei is not None
+        if scei is None:
+            pytest.skip(
+                "needs the scei_ar_assistant template, which the th2customers "
+                "client overlay registers and this repository does not"
+            )
         assert scei.get("visible_to_orgs") == ["scei"], (
             f"expected ['scei'], got {scei.get('visible_to_orgs')!r} — "
             "the visibility restriction must travel with the template"
